@@ -1,0 +1,1506 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>POS Mini Market - Offline</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom styles for receipt printing */
+        @media print {
+            body * {
+                visibility: hidden;
+            }
+            .receipt-print, .receipt-print * {
+                visibility: visible;
+            }
+            .receipt-print {
+                position: absolute;
+                left: 0;
+                top: 0;
+                width: 80mm;
+                font-size: 12px;
+                line-height: 1.2;
+            }
+            @page {
+                size: 80mm auto;
+                margin: 0;
+            }
+        }
+        
+        /* Hide scrollbar but keep functionality */
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 6px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: #f1f1f1;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: #888;
+            border-radius: 3px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+            background: #555;
+        }
+    </style>
+</head>
+<body class="bg-gray-100">
+    <div id="app"></div>
+
+    <!-- Receipt Template (Hidden, only visible when printing) -->
+    <div id="receipt-template" class="receipt-print hidden">
+        <div class="text-center mb-2">
+            <h3 class="font-bold" id="receipt-store-name">MINI MARKET</h3>
+            <p class="text-xs" id="receipt-store-address">Alamat Toko</p>
+            <p class="text-xs" id="receipt-store-phone">Telp: -</p>
+            <div class="border-t border-dashed border-black my-2"></div>
+        </div>
+        
+        <div class="mb-2">
+            <p class="text-xs">No: <span id="receipt-transaction-no"></span></p>
+            <p class="text-xs">Tanggal: <span id="receipt-date"></span></p>
+            <p class="text-xs">Kasir: <span id="receipt-cashier"></span></p>
+            <div class="border-t border-dashed border-black my-2"></div>
+        </div>
+        
+        <div id="receipt-items" class="mb-2">
+            <!-- Items will be populated by JavaScript -->
+        </div>
+        
+        <div class="border-t border-dashed border-black my-2"></div>
+        <div class="text-right">
+            <p class="text-sm">Subtotal: Rp <span id="receipt-subtotal"></span></p>
+            <p class="text-sm">Diskon: Rp <span id="receipt-discount"></span></p>
+            <p class="font-bold">Total: Rp <span id="receipt-total"></span></p>
+            <p class="text-sm">Bayar: Rp <span id="receipt-paid"></span></p>
+            <p class="text-sm">Kembalian: Rp <span id="receipt-change"></span></p>
+        </div>
+        
+        <div class="border-t border-dashed border-black my-2"></div>
+        <div class="text-center">
+            <p class="text-xs">Terima kasih atas kunjungan Anda!</p>
+            <p class="text-xs">Barang yang sudah dibeli tidak dapat dikembalikan</p>
+        </div>
+    </div>
+
+    <script>
+        // Vue.js Application
+        const { createApp, ref, reactive, computed, onMounted, nextTick } = Vue;
+
+        // IndexedDB Helper
+        class DBHelper {
+            constructor() {
+                this.dbName = 'POS_DB';
+                this.version = 1;
+                this.db = null;
+            }
+
+            async init() {
+                return new Promise((resolve, reject) => {
+                    const request = indexedDB.open(this.dbName, this.version);
+                    
+                    request.onerror = () => reject(request.error);
+                    request.onsuccess = () => {
+                        this.db = request.result;
+                        resolve(this.db);
+                    };
+                    
+                    request.onupgradeneeded = (event) => {
+                        const db = event.target.result;
+                        
+                        // Products store
+                        if (!db.objectStoreNames.contains('products')) {
+                            const productStore = db.createObjectStore('products', { keyPath: 'sku' });
+                            productStore.createIndex('name', 'name', { unique: false });
+                            productStore.createIndex('category', 'category', { unique: false });
+                        }
+                        
+                        // Transactions store
+                        if (!db.objectStoreNames.contains('transactions')) {
+                            const transactionStore = db.createObjectStore('transactions', { keyPath: 'id' });
+                            transactionStore.createIndex('date', 'date', { unique: false });
+                            transactionStore.createIndex('cashier', 'cashier', { unique: false });
+                        }
+                        
+                        // Users store
+                        if (!db.objectStoreNames.contains('users')) {
+                            const userStore = db.createObjectStore('users', { keyPath: 'username' });
+                        }
+                        
+                        // Settings store
+                        if (!db.objectStoreNames.contains('settings')) {
+                            db.createObjectStore('settings', { keyPath: 'key' });
+                        }
+                    };
+                });
+            }
+
+            async add(storeName, data) {
+                const transaction = this.db.transaction([storeName], 'readwrite');
+                const store = transaction.objectStore(storeName);
+                return store.add(data);
+            }
+
+            async put(storeName, data) {
+                const transaction = this.db.transaction([storeName], 'readwrite');
+                const store = transaction.objectStore(storeName);
+                return store.put(data);
+            }
+
+            async get(storeName, key) {
+                const transaction = this.db.transaction([storeName], 'readonly');
+                const store = transaction.objectStore(storeName);
+                return new Promise((resolve, reject) => {
+                    const request = store.get(key);
+                    request.onsuccess = () => resolve(request.result);
+                    request.onerror = () => reject(request.error);
+                });
+            }
+
+            async getAll(storeName) {
+                const transaction = this.db.transaction([storeName], 'readonly');
+                const store = transaction.objectStore(storeName);
+                return new Promise((resolve, reject) => {
+                    const request = store.getAll();
+                    request.onsuccess = () => resolve(request.result);
+                    request.onerror = () => reject(request.error);
+                });
+            }
+
+            async delete(storeName, key) {
+                const transaction = this.db.transaction([storeName], 'readwrite');
+                const store = transaction.objectStore(storeName);
+                return store.delete(key);
+            }
+
+            async clear(storeName) {
+                const transaction = this.db.transaction([storeName], 'readwrite');
+                const store = transaction.objectStore(storeName);
+                return store.clear();
+            }
+        }
+
+        // Initialize database
+        const dbHelper = new DBHelper();
+
+        // Main Vue Application
+        createApp({
+            setup() {
+                // Reactive state
+                const currentView = ref('login');
+                const currentUser = ref(null);
+                const products = ref([]);
+                const transactions = ref([]);
+                const users = ref([]);
+                const settings = ref({
+                    storeName: 'MINI MARKET',
+                    storeAddress: 'Jl. Contoh No. 123',
+                    storePhone: '081234567890'
+                });
+                
+                // Cart state
+                const cart = ref([]);
+                const cartTotal = computed(() => {
+                    return cart.value.reduce((total, item) => total + (item.price * item.quantity), 0);
+                });
+
+                // Product management
+                const productForm = reactive({
+                    sku: '',
+                    name: '',
+                    category: '',
+                    stock: 0,
+                    buyPrice: 0,
+                    sellPrice: 0
+                });
+                const showProductModal = ref(false);
+                const editingProduct = ref(null);
+
+                // Transaction state
+                const searchProduct = ref('');
+                const paymentAmount = ref(0);
+                const showPaymentModal = ref(false);
+                const currentTransaction = ref(null);
+
+                // Report state
+                const reportDateFrom = ref('');
+                const reportDateTo = ref('');
+                const salesReport = ref(null);
+                const topProducts = ref([]);
+
+                // Retur state
+                const showReturModal = ref(false);
+                const returTransactionNo = ref('');
+                const returItems = ref([]);
+                const adminPassword = ref('');
+
+                // Initialize application
+                onMounted(async () => {
+                    await dbHelper.init();
+                    await loadInitialData();
+                    await loadData();
+                });
+
+                // Load initial data (default users, sample products)
+                async function loadInitialData() {
+                    // Check if users exist, if not create default users
+                    const existingUsers = await dbHelper.getAll('users');
+                    if (existingUsers.length === 0) {
+                        await dbHelper.add('users', {
+                            username: 'admin',
+                            password: 'admin123',
+                            role: 'admin',
+                            name: 'Administrator'
+                        });
+                        await dbHelper.add('users', {
+                            username: 'kasir',
+                            password: 'kasir123',
+                            role: 'kasir',
+                            name: 'Kasir'
+                        });
+                    }
+
+                    // Add sample products if none exist
+                    const existingProducts = await dbHelper.getAll('products');
+                    if (existingProducts.length === 0) {
+                        const sampleProducts = [
+                            { sku: '1001', name: 'Indomie Ayam Bawang', category: 'Makanan', stock: 50, buyPrice: 2500, sellPrice: 3000 },
+                            { sku: '1002', name: 'Aqua 600ml', category: 'Minuman', stock: 30, buyPrice: 3000, sellPrice: 4000 },
+                            { sku: '1003', name: 'Teh Botol Sosro', category: 'Minuman', stock: 25, buyPrice: 4000, sellPrice: 5000 },
+                            { sku: '1004', name: 'Biskuit Roma Kelapa', category: 'Makanan', stock: 20, buyPrice: 5000, sellPrice: 6500 },
+                            { sku: '1005', name: 'Sabun Lifebuoy', category: 'Kebersihan', stock: 15, buyPrice: 8000, sellPrice: 10000 }
+                        ];
+                        
+                        for (const product of sampleProducts) {
+                            await dbHelper.add('products', product);
+                        }
+                    }
+
+                    // Load default settings if not exist
+                    const storeSettings = await dbHelper.get('settings', 'store');
+                    if (storeSettings) {
+                        settings.value = storeSettings.value;
+                    } else {
+                        await dbHelper.put('settings', {
+                            key: 'store',
+                            value: JSON.parse(JSON.stringify(settings.value))
+                        });
+                    }
+                }
+
+                // Load data from IndexedDB
+                async function loadData() {
+                    try {
+                        products.value = await dbHelper.getAll('products');
+                        transactions.value = await dbHelper.getAll('transactions');
+                        users.value = await dbHelper.getAll('users');
+                        
+                        const storeSettings = await dbHelper.get('settings', 'store');
+                        if (storeSettings) {
+                            Object.assign(settings.value, storeSettings.value);
+                        }
+                    } catch (error) {
+                        console.error('Error loading data:', error);
+                    }
+                }
+
+                // Authentication
+                async function login(username, password) {
+                    const user = await dbHelper.get('users', username);
+                    if (user && user.password === password) {
+                        currentUser.value = user;
+                        currentView.value = user.role === 'admin' ? 'admin-dashboard' : 'cashier';
+                        return true;
+                    }
+                    return false;
+                }
+
+                function logout() {
+                    currentUser.value = null;
+                    currentView.value = 'login';
+                    cart.value = [];
+                }
+
+                // Navigation
+                function navigateTo(view) {
+                    currentView.value = view;
+                }
+
+                // Product Management
+                function openProductModal(product = null) {
+                    if (product) {
+                        editingProduct.value = product;
+                        Object.assign(productForm, product);
+                    } else {
+                        editingProduct.value = null;
+                        resetProductForm();
+                    }
+                    showProductModal.value = true;
+                }
+
+                function resetProductForm() {
+                    Object.assign(productForm, {
+                        sku: '',
+                        name: '',
+                        category: '',
+                        stock: 0,
+                        buyPrice: 0,
+                        sellPrice: 0
+                    });
+                }
+
+                async function saveProduct() {
+                    try {
+                        const plainProduct = JSON.parse(JSON.stringify(productForm));
+                        if (editingProduct.value) {
+                            await dbHelper.put('products', plainProduct);
+                        } else {
+                            // Check if SKU already exists
+                            const existing = await dbHelper.get('products', plainProduct.sku);
+                            if (existing) {
+                                alert('SKU sudah ada! Gunakan SKU yang berbeda.');
+                                return;
+                            }
+                            await dbHelper.add('products', plainProduct);
+                        }
+                        
+                        await loadData();
+                        showProductModal.value = false;
+                        resetProductForm();
+                    } catch (error) {
+                        console.error('Error saving product:', error);
+                        alert('Gagal menyimpan produk');
+                    }
+                }
+
+                async function deleteProduct(sku) {
+                    if (confirm('Apakah Anda yakin ingin menghapus produk ini?')) {
+                        try {
+                            await dbHelper.delete('products', sku);
+                            await loadData();
+                        } catch (error) {
+                            console.error('Error deleting product:', error);
+                        }
+                    }
+                }
+
+                // Cart Management
+                function addToCart(product) {
+                    const existingItem = cart.value.find(item => item.sku === product.sku);
+                    if (existingItem) {
+                        if (existingItem.quantity < product.stock) {
+                            existingItem.quantity++;
+                        } else {
+                            alert('Stok tidak mencukupi!');
+                        }
+                    } else {
+                        if (product.stock > 0) {
+                            cart.value.push({
+                                sku: product.sku,
+                                name: product.name,
+                                price: product.sellPrice,
+                                quantity: 1,
+                                stock: product.stock
+                            });
+                        } else {
+                            alert('Stok habis!');
+                        }
+                    }
+                }
+
+                function removeFromCart(sku) {
+                    const index = cart.value.findIndex(item => item.sku === sku);
+                    if (index > -1) {
+                        cart.value.splice(index, 1);
+                    }
+                }
+
+                function updateCartQuantity(sku, change) {
+                    const item = cart.value.find(item => item.sku === sku);
+                    if (item) {
+                        const newQuantity = item.quantity + change;
+                        if (newQuantity <= 0) {
+                            removeFromCart(sku);
+                        } else if (newQuantity <= item.stock) {
+                            item.quantity = newQuantity;
+                        } else {
+                            alert('Stok tidak mencukupi!');
+                        }
+                    }
+                }
+
+                // Product Search
+                const filteredProducts = computed(() => {
+                    if (!searchProduct.value) return products.value;
+                    const search = searchProduct.value.toLowerCase();
+                    return products.value.filter(product => 
+                        product.name.toLowerCase().includes(search) ||
+                        product.sku.includes(search)
+                    );
+                });
+
+                // Handle barcode scanner input
+                function handleProductSearch(event) {
+                    if (event.key === 'Enter') {
+                        const product = products.value.find(p => 
+                            p.sku === searchProduct.value || 
+                            p.name.toLowerCase().includes(searchProduct.value.toLowerCase())
+                        );
+                        if (product) {
+                            addToCart(product);
+                            searchProduct.value = '';
+                        }
+                    }
+                }
+
+                // Payment Processing
+                function openPaymentModal() {
+                    if (cart.value.length === 0) {
+                        alert('Keranjang kosong!');
+                        return;
+                    }
+                    paymentAmount.value = 0;
+                    showPaymentModal.value = true;
+                }
+
+                const changeAmount = computed(() => {
+                    return Math.max(0, paymentAmount.value - cartTotal.value);
+                });
+
+                async function processPayment() {
+                    if (paymentAmount.value < cartTotal.value) {
+                        alert('Jumlah pembayaran kurang!');
+                        return;
+                    }
+
+                    try {
+                        // Create transaction with plain objects
+                        const plainCartItems = JSON.parse(JSON.stringify(cart.value));
+                        const transactionId = 'TRX' + Date.now();
+                        const transaction = {
+                            id: transactionId,
+                            date: new Date().toISOString(),
+                            cashier: currentUser.value.name,
+                            items: plainCartItems,
+                            subtotal: cartTotal.value,
+                            discount: 0,
+                            total: cartTotal.value,
+                            paid: paymentAmount.value,
+                            change: changeAmount.value
+                        };
+
+                        // Save transaction
+                        await dbHelper.add('transactions', transaction);
+
+                        // Update product stock
+                        for (const item of cart.value) {
+                            const product = products.value.find(p => p.sku === item.sku);
+                            if (product) {
+                                const updatedProduct = JSON.parse(JSON.stringify(product));
+                                updatedProduct.stock -= item.quantity;
+                                await dbHelper.put('products', updatedProduct);
+                            }
+                        }
+
+                        // Print receipt
+                        currentTransaction.value = transaction;
+                        await printReceipt(transaction);
+
+                        // Clear cart and close modal
+                        cart.value = [];
+                        showPaymentModal.value = false;
+                        await loadData();
+
+                    } catch (error) {
+                        console.error('Error processing payment:', error);
+                        alert('Gagal memproses pembayaran');
+                    }
+                }
+
+                // Receipt Printing
+                async function printReceipt(transaction) {
+                    await nextTick();
+                    
+                    // Populate receipt template
+                    document.getElementById('receipt-store-name').textContent = settings.value.storeName;
+                    document.getElementById('receipt-store-address').textContent = settings.value.storeAddress;
+                    document.getElementById('receipt-store-phone').textContent = `Telp: ${settings.value.storePhone}`;
+                    document.getElementById('receipt-transaction-no').textContent = transaction.id;
+                    document.getElementById('receipt-date').textContent = new Date(transaction.date).toLocaleString('id-ID');
+                    document.getElementById('receipt-cashier').textContent = transaction.cashier;
+                    
+                    // Populate items
+                    const itemsContainer = document.getElementById('receipt-items');
+                    itemsContainer.innerHTML = '';
+                    transaction.items.forEach(item => {
+                        const itemDiv = document.createElement('div');
+                        itemDiv.innerHTML = `
+                            <div class="flex justify-between text-xs mb-1">
+                                <span>${item.name}</span>
+                            </div>
+                            <div class="flex justify-between text-xs">
+                                <span>${item.quantity} x ${formatCurrency(item.price)}</span>
+                                <span>${formatCurrency(item.quantity * item.price)}</span>
+                            </div>
+                        `;
+                        itemsContainer.appendChild(itemDiv);
+                    });
+                    
+                    document.getElementById('receipt-subtotal').textContent = formatCurrency(transaction.subtotal);
+                    document.getElementById('receipt-discount').textContent = formatCurrency(transaction.discount);
+                    document.getElementById('receipt-total').textContent = formatCurrency(transaction.total);
+                    document.getElementById('receipt-paid').textContent = formatCurrency(transaction.paid);
+                    document.getElementById('receipt-change').textContent = formatCurrency(transaction.change);
+                    
+                    // Show receipt and print
+                    document.getElementById('receipt-template').classList.remove('hidden');
+                    window.print();
+                    document.getElementById('receipt-template').classList.add('hidden');
+                }
+
+                // Reports
+                async function generateSalesReport() {
+                    if (!reportDateFrom.value || !reportDateTo.value) {
+                        alert('Pilih rentang tanggal terlebih dahulu!');
+                        return;
+                    }
+
+                    const startDate = new Date(reportDateFrom.value);
+                    const endDate = new Date(reportDateTo.value + 'T23:59:59');
+
+                    const filteredTransactions = transactions.value.filter(t => {
+                        const transactionDate = new Date(t.date);
+                        return transactionDate >= startDate && transactionDate <= endDate;
+                    });
+
+                    let totalRevenue = 0;
+                    let totalProfit = 0;
+                    const productSales = {};
+
+                    filteredTransactions.forEach(transaction => {
+                        totalRevenue += transaction.total;
+                        
+                        transaction.items.forEach(item => {
+                            const product = products.value.find(p => p.sku === item.sku);
+                            if (product) {
+                                const profit = (item.price - product.buyPrice) * item.quantity;
+                                totalProfit += profit;
+                                
+                                if (!productSales[item.sku]) {
+                                    productSales[item.sku] = {
+                                        name: item.name,
+                                        quantity: 0
+                                    };
+                                }
+                                productSales[item.sku].quantity += item.quantity;
+                            }
+                        });
+                    });
+
+                    salesReport.value = {
+                        totalRevenue,
+                        totalTransactions: filteredTransactions.length,
+                        totalProfit,
+                        transactions: filteredTransactions
+                    };
+
+                    // Generate top products
+                    topProducts.value = Object.entries(productSales)
+                        .map(([sku, data]) => ({ sku, ...data }))
+                        .sort((a, b) => b.quantity - a.quantity)
+                        .slice(0, 10);
+                }
+
+                function exportToCSV(data, filename) {
+                    let csv = '';
+                    
+                    if (filename.includes('sales')) {
+                        csv = 'No Transaksi,Tanggal,Kasir,Total\n';
+                        data.forEach(transaction => {
+                            csv += `${transaction.id},${new Date(transaction.date).toLocaleString('id-ID')},${transaction.cashier},${transaction.total}\n`;
+                        });
+                    } else if (filename.includes('products')) {
+                        csv = 'SKU,Nama Produk,Jumlah Terjual\n';
+                        data.forEach(product => {
+                            csv += `${product.sku},${product.name},${product.quantity}\n`;
+                        });
+                    }
+
+                    const blob = new Blob([csv], { type: 'text/csv' });
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = filename;
+                    a.click();
+                    window.URL.revokeObjectURL(url);
+                }
+
+                // Settings Management
+                async function saveSettings() {
+                    try {
+                        await dbHelper.put('settings', {
+                            key: 'store',
+                            value: JSON.parse(JSON.stringify(settings.value))
+                        });
+                        alert('Pengaturan berhasil disimpan!');
+                    } catch (error) {
+                        console.error('Error saving settings:', error);
+                        alert('Gagal menyimpan pengaturan');
+                    }
+                }
+
+                // User Management
+                async function addUser(username, password, role, name) {
+                    try {
+                        const existingUser = await dbHelper.get('users', username);
+                        if (existingUser) {
+                            alert('Username sudah ada!');
+                            return false;
+                        }
+                        
+                        await dbHelper.add('users', { username, password, role, name });
+                        await loadData();
+                        return true;
+                    } catch (error) {
+                        console.error('Error adding user:', error);
+                        return false;
+                    }
+                }
+
+                async function deleteUser(username) {
+                    if (username === 'admin') {
+                        alert('Tidak dapat menghapus user admin!');
+                        return;
+                    }
+                    
+                    if (confirm(`Hapus user ${username}?`)) {
+                        try {
+                            await dbHelper.delete('users', username);
+                            await loadData();
+                        } catch (error) {
+                            console.error('Error deleting user:', error);
+                        }
+                    }
+                }
+
+                // Backup & Restore
+                async function backupData() {
+                    try {
+                        const data = {
+                            products: await dbHelper.getAll('products'),
+                            transactions: await dbHelper.getAll('transactions'),
+                            users: await dbHelper.getAll('users'),
+                            settings: await dbHelper.getAll('settings')
+                        };
+
+                        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = `pos-backup-${new Date().toISOString().split('T')[0]}.json`;
+                        a.click();
+                        URL.revokeObjectURL(url);
+                    } catch (error) {
+                        console.error('Error creating backup:', error);
+                        alert('Gagal membuat backup');
+                    }
+                }
+
+                async function restoreData(event) {
+                    const file = event.target.files[0];
+                    if (!file) return;
+
+                    if (!confirm('Ini akan menimpa semua data yang ada. Lanjutkan?')) {
+                        return;
+                    }
+
+                    try {
+                        const text = await file.text();
+                        const data = JSON.parse(text);
+
+                        // Clear existing data
+                        await dbHelper.clear('products');
+                        await dbHelper.clear('transactions');
+                        await dbHelper.clear('users');
+                        await dbHelper.clear('settings');
+
+                        // Restore data
+                        for (const product of data.products || []) {
+                            await dbHelper.add('products', product);
+                        }
+                        for (const transaction of data.transactions || []) {
+                            await dbHelper.add('transactions', transaction);
+                        }
+                        for (const user of data.users || []) {
+                            await dbHelper.add('users', user);
+                        }
+                        for (const setting of data.settings || []) {
+                            await dbHelper.add('settings', setting);
+                        }
+
+                        await loadData();
+                        alert('Data berhasil dipulihkan!');
+                    } catch (error) {
+                        console.error('Error restoring data:', error);
+                        alert('Gagal memulihkan data');
+                    }
+                }
+
+                // Retur Management
+                function openReturModal() {
+                    showReturModal.value = true;
+                    returTransactionNo.value = '';
+                    returItems.value = [];
+                    adminPassword.value = '';
+                }
+
+                async function searchReturTransaction() {
+                    if (!returTransactionNo.value) return;
+
+                    const transaction = transactions.value.find(t => t.id === returTransactionNo.value);
+                    if (transaction) {
+                        returItems.value = transaction.items.map(item => ({
+                            ...item,
+                            returQuantity: 0,
+                            selected: false
+                        }));
+                    } else {
+                        alert('Transaksi tidak ditemukan!');
+                    }
+                }
+
+                async function processRetur() {
+                    // Verify admin password
+                    const adminUser = await dbHelper.get('users', 'admin');
+                    if (!adminUser || adminUser.password !== adminPassword.value) {
+                        alert('Password admin salah!');
+                        return;
+                    }
+
+                    const returItemsSelected = returItems.value.filter(item => item.selected && item.returQuantity > 0);
+                    if (returItemsSelected.length === 0) {
+                        alert('Pilih item yang akan diretur!');
+                        return;
+                    }
+
+                    try {
+                        // Update product stock
+                        for (const item of returItemsSelected) {
+                            const product = products.value.find(p => p.sku === item.sku);
+                            if (product) {
+                                const updatedProduct = JSON.parse(JSON.stringify(product));
+                                updatedProduct.stock += item.returQuantity;
+                                await dbHelper.put('products', updatedProduct);
+                            }
+                        }
+
+                        // Create retur transaction record
+                        const plainReturItems = JSON.parse(JSON.stringify(returItemsSelected));
+                        const returTransaction = {
+                            id: 'RTR' + Date.now(),
+                            date: new Date().toISOString(),
+                            originalTransaction: returTransactionNo.value,
+                            cashier: currentUser.value.name,
+                            items: plainReturItems,
+                            total: plainReturItems.reduce((sum, item) => sum + (item.price * item.returQuantity), 0)
+                        };
+
+                        await dbHelper.add('transactions', returTransaction);
+                        await loadData();
+                        
+                        showReturModal.value = false;
+                        alert('Retur berhasil diproses!');
+                    } catch (error) {
+                        console.error('Error processing retur:', error);
+                        alert('Gagal memproses retur');
+                    }
+                }
+
+                // Utility functions
+                function formatCurrency(amount) {
+                    return new Intl.NumberFormat('id-ID').format(amount);
+                }
+
+                function formatDate(dateString) {
+                    return new Date(dateString).toLocaleDateString('id-ID');
+                }
+
+                // Return reactive data and methods
+                return {
+                    // State
+                    currentView,
+                    currentUser,
+                    products,
+                    transactions,
+                    users,
+                    settings,
+                    cart,
+                    cartTotal,
+                    productForm,
+                    showProductModal,
+                    editingProduct,
+                    searchProduct,
+                    filteredProducts,
+                    paymentAmount,
+                    showPaymentModal,
+                    changeAmount,
+                    reportDateFrom,
+                    reportDateTo,
+                    salesReport,
+                    topProducts,
+                    showReturModal,
+                    returTransactionNo,
+                    returItems,
+                    adminPassword,
+                    
+                    // Methods
+                    login,
+                    logout,
+                    navigateTo,
+                    openProductModal,
+                    saveProduct,
+                    deleteProduct,
+                    resetProductForm,
+                    addToCart,
+                    removeFromCart,
+                    updateCartQuantity,
+                    handleProductSearch,
+                    openPaymentModal,
+                    processPayment,
+                    generateSalesReport,
+                    exportToCSV,
+                    saveSettings,
+                    addUser,
+                    deleteUser,
+                    backupData,
+                    restoreData,
+                    openReturModal,
+                    searchReturTransaction,
+                    processRetur,
+                    formatCurrency,
+                    formatDate
+                };
+            },
+            
+            template: `
+                <!-- Login View -->
+                <div v-if="currentView === 'login'" class="min-h-screen flex items-center justify-center bg-gradient-to-br from-blue-500 to-purple-600">
+                    <div class="bg-white rounded-lg shadow-xl p-8 w-full max-w-md">
+                        <div class="text-center mb-8">
+                            <h1 class="text-3xl font-bold text-gray-800">POS Mini Market</h1>
+                            <p class="text-gray-600 mt-2">Sistem Point of Sale Offline</p>
+                        </div>
+                        
+                        <form @submit.prevent="handleLogin" class="space-y-6">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-2">Username</label>
+                                <input v-model="loginForm.username" type="text" required
+                                       class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            </div>
+                            
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-2">Password</label>
+                                <input v-model="loginForm.password" type="password" required
+                                       class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            </div>
+                            
+                            <button type="submit" class="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 transition duration-200">
+                                Masuk
+                            </button>
+                        </form>
+                        
+                        <div class="mt-6 text-center text-sm text-gray-600">
+                            <p>Default Login:</p>
+                            <p>Admin: admin / admin123</p>
+                            <p>Kasir: kasir / kasir123</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Main Application (After Login) -->
+                <div v-else class="min-h-screen bg-gray-100">
+                    <!-- Navigation Header -->
+                    <header class="bg-white shadow-sm border-b">
+                        <div class="flex items-center justify-between px-6 py-4">
+                            <div class="flex items-center space-x-4">
+                                <h1 class="text-xl font-semibold text-gray-800">{{ settings.storeName }}</h1>
+                                <span class="text-sm text-gray-500">{{ currentUser.name }} ({{ currentUser.role }})</span>
+                            </div>
+                            
+                            <nav class="flex items-center space-x-4">
+                                <button v-if="currentUser.role === 'admin'" 
+                                        @click="navigateTo('admin-dashboard')"
+                                        :class="{'bg-blue-100 text-blue-700': currentView === 'admin-dashboard'}"
+                                        class="px-3 py-2 rounded-md text-sm font-medium hover:bg-gray-100">
+                                    Dashboard
+                                </button>
+                                
+                                <button @click="navigateTo('cashier')"
+                                        :class="{'bg-blue-100 text-blue-700': currentView === 'cashier'}"
+                                        class="px-3 py-2 rounded-md text-sm font-medium hover:bg-gray-100">
+                                    Kasir
+                                </button>
+                                
+                                <button @click="logout" class="px-3 py-2 rounded-md text-sm font-medium text-red-600 hover:bg-red-50">
+                                    Keluar
+                                </button>
+                            </nav>
+                        </div>
+                    </header>
+
+                    <!-- Admin Dashboard -->
+                    <div v-if="currentView === 'admin-dashboard'" class="p-6">
+                        <div class="mb-6">
+                            <h2 class="text-2xl font-bold text-gray-800 mb-4">Dashboard Admin</h2>
+                            
+                            <!-- Quick Stats -->
+                            <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-6">
+                                <div class="bg-white rounded-lg shadow p-6">
+                                    <div class="text-sm font-medium text-gray-500">Total Produk</div>
+                                    <div class="text-2xl font-bold text-gray-900">{{ products.length }}</div>
+                                </div>
+                                <div class="bg-white rounded-lg shadow p-6">
+                                    <div class="text-sm font-medium text-gray-500">Transaksi Hari Ini</div>
+                                    <div class="text-2xl font-bold text-gray-900">{{ transactions.filter(t => formatDate(t.date) === formatDate(new Date())).length }}</div>
+                                </div>
+                                <div class="bg-white rounded-lg shadow p-6">
+                                    <div class="text-sm font-medium text-gray-500">Stok Menipis</div>
+                                    <div class="text-2xl font-bold text-red-600">{{ products.filter(p => p.stock < 10).length }}</div>
+                                </div>
+                                <div class="bg-white rounded-lg shadow p-6">
+                                    <div class="text-sm font-medium text-gray-500">Total Pengguna</div>
+                                    <div class="text-2xl font-bold text-gray-900">{{ users.length }}</div>
+                                </div>
+                            </div>
+                            
+                            <!-- Admin Tabs -->
+                            <div class="bg-white rounded-lg shadow">
+                                <div class="border-b border-gray-200">
+                                    <nav class="flex space-x-8 px-6" role="tablist">
+                                        <button @click="adminTab = 'inventory'" 
+                                                :class="{'border-blue-500 text-blue-600': adminTab === 'inventory'}"
+                                                class="py-4 px-1 border-b-2 border-transparent font-medium text-sm hover:text-gray-700">
+                                            Inventaris
+                                        </button>
+                                        <button @click="adminTab = 'reports'" 
+                                                :class="{'border-blue-500 text-blue-600': adminTab === 'reports'}"
+                                                class="py-4 px-1 border-b-2 border-transparent font-medium text-sm hover:text-gray-700">
+                                            Laporan
+                                        </button>
+                                        <button @click="adminTab = 'settings'" 
+                                                :class="{'border-blue-500 text-blue-600': adminTab === 'settings'}"
+                                                class="py-4 px-1 border-b-2 border-transparent font-medium text-sm hover:text-gray-700">
+                                            Pengaturan
+                                        </button>
+                                    </nav>
+                                </div>
+                                
+                                <!-- Inventory Tab -->
+                                <div v-if="adminTab === 'inventory'" class="p-6">
+                                    <div class="flex justify-between items-center mb-4">
+                                        <h3 class="text-lg font-medium">Manajemen Produk</h3>
+                                        <button @click="openProductModal()" class="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700">
+                                            Tambah Produk
+                                        </button>
+                                    </div>
+                                    
+                                    <div class="overflow-x-auto">
+                                        <table class="min-w-full divide-y divide-gray-200">
+                                            <thead class="bg-gray-50">
+                                                <tr>
+                                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">SKU</th>
+                                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Nama Produk</th>
+                                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Kategori</th>
+                                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Stok</th>
+                                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Harga Beli</th>
+                                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Harga Jual</th>
+                                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Aksi</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody class="bg-white divide-y divide-gray-200">
+                                                <tr v-for="product in products" :key="product.sku">
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{{ product.sku }}</td>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{{ product.name }}</td>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{{ product.category }}</td>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                                                        <span :class="{'text-red-600': product.stock < 10}">{{ product.stock }}</span>
+                                                    </td>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">Rp {{ formatCurrency(product.buyPrice) }}</td>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">Rp {{ formatCurrency(product.sellPrice) }}</td>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium space-x-2">
+                                                        <button @click="openProductModal(product)" class="text-blue-600 hover:text-blue-900">Edit</button>
+                                                        <button @click="deleteProduct(product.sku)" class="text-red-600 hover:text-red-900">Hapus</button>
+                                                    </td>
+                                                </tr>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                                
+                                <!-- Reports Tab -->
+                                <div v-if="adminTab === 'reports'" class="p-6">
+                                    <h3 class="text-lg font-medium mb-4">Laporan & Analitik</h3>
+                                    
+                                    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
+                                        <div>
+                                            <label class="block text-sm font-medium text-gray-700 mb-2">Dari Tanggal</label>
+                                            <input v-model="reportDateFrom" type="date" class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                                        </div>
+                                        <div>
+                                            <label class="block text-sm font-medium text-gray-700 mb-2">Sampai Tanggal</label>
+                                            <input v-model="reportDateTo" type="date" class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                                        </div>
+                                        <div class="flex items-end">
+                                            <button @click="generateSalesReport()" class="w-full bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700">
+                                                Generate Laporan
+                                            </button>
+                                        </div>
+                                    </div>
+                                    
+                                    <div v-if="salesReport" class="space-y-6">
+                                        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                            <div class="bg-blue-50 p-4 rounded-lg">
+                                                <div class="text-sm font-medium text-blue-700">Total Pendapatan</div>
+                                                <div class="text-2xl font-bold text-blue-900">Rp {{ formatCurrency(salesReport.totalRevenue) }}</div>
+                                            </div>
+                                            <div class="bg-green-50 p-4 rounded-lg">
+                                                <div class="text-sm font-medium text-green-700">Jumlah Transaksi</div>
+                                                <div class="text-2xl font-bold text-green-900">{{ salesReport.totalTransactions }}</div>
+                                            </div>
+                                            <div class="bg-purple-50 p-4 rounded-lg">
+                                                <div class="text-sm font-medium text-purple-700">Laba Kotor</div>
+                                                <div class="text-2xl font-bold text-purple-900">Rp {{ formatCurrency(salesReport.totalProfit) }}</div>
+                                            </div>
+                                        </div>
+                                        
+                                        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                                            <div class="bg-white border rounded-lg p-4">
+                                                <div class="flex justify-between items-center mb-4">
+                                                    <h4 class="font-medium">Transaksi</h4>
+                                                    <button @click="exportToCSV(salesReport.transactions, 'sales-report.csv')" 
+                                                            class="text-sm bg-gray-600 text-white px-3 py-1 rounded hover:bg-gray-700">
+                                                        Export CSV
+                                                    </button>
+                                                </div>
+                                                <div class="max-h-64 overflow-y-auto custom-scrollbar">
+                                                    <div v-for="transaction in salesReport.transactions" :key="transaction.id" 
+                                                         class="flex justify-between py-2 border-b border-gray-100">
+                                                        <div>{{ transaction.id }}</div>
+                                                        <div>Rp {{ formatCurrency(transaction.total) }}</div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            
+                                            <div class="bg-white border rounded-lg p-4">
+                                                <div class="flex justify-between items-center mb-4">
+                                                    <h4 class="font-medium">Produk Terlaris</h4>
+                                                    <button @click="exportToCSV(topProducts, 'top-products.csv')" 
+                                                            class="text-sm bg-gray-600 text-white px-3 py-1 rounded hover:bg-gray-700">
+                                                        Export CSV
+                                                    </button>
+                                                </div>
+                                                <div class="max-h-64 overflow-y-auto custom-scrollbar">
+                                                    <div v-for="product in topProducts" :key="product.sku" 
+                                                         class="flex justify-between py-2 border-b border-gray-100">
+                                                        <div>{{ product.name }}</div>
+                                                        <div class="font-medium">{{ product.quantity }}</div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <!-- Settings Tab -->
+                                <div v-if="adminTab === 'settings'" class="p-6">
+                                    <h3 class="text-lg font-medium mb-6">Pengaturan Sistem</h3>
+                                    
+                                    <div class="space-y-8">
+                                        <!-- Store Settings -->
+                                        <div class="bg-gray-50 p-4 rounded-lg">
+                                            <h4 class="font-medium mb-4">Informasi Toko</h4>
+                                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                <div>
+                                                    <label class="block text-sm font-medium text-gray-700 mb-2">Nama Toko</label>
+                                                    <input v-model="settings.storeName" type="text" class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                                                </div>
+                                                <div>
+                                                    <label class="block text-sm font-medium text-gray-700 mb-2">Telepon</label>
+                                                    <input v-model="settings.storePhone" type="text" class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                                                </div>
+                                                <div class="md:col-span-2">
+                                                    <label class="block text-sm font-medium text-gray-700 mb-2">Alamat</label>
+                                                    <textarea v-model="settings.storeAddress" rows="3" class="w-full px-3 py-2 border border-gray-300 rounded-md"></textarea>
+                                                </div>
+                                            </div>
+                                            <button @click="saveSettings()" class="mt-4 bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700">
+                                                Simpan Pengaturan
+                                            </button>
+                                        </div>
+                                        
+                                        <!-- User Management -->
+                                        <div class="bg-gray-50 p-4 rounded-lg">
+                                            <h4 class="font-medium mb-4">Manajemen Pengguna</h4>
+                                            <div class="overflow-x-auto mb-4">
+                                                <table class="min-w-full divide-y divide-gray-200">
+                                                    <thead>
+                                                        <tr>
+                                                            <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Username</th>
+                                                            <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Nama</th>
+                                                            <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Role</th>
+                                                            <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Aksi</th>
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody class="divide-y divide-gray-200">
+                                                        <tr v-for="user in users" :key="user.username">
+                                                            <td class="px-4 py-2 text-sm">{{ user.username }}</td>
+                                                            <td class="px-4 py-2 text-sm">{{ user.name }}</td>
+                                                            <td class="px-4 py-2 text-sm">{{ user.role }}</td>
+                                                            <td class="px-4 py-2 text-sm">
+                                                                <button v-if="user.username !== 'admin'" @click="deleteUser(user.username)" 
+                                                                        class="text-red-600 hover:text-red-900">Hapus</button>
+                                                            </td>
+                                                        </tr>
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                            
+                                            <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+                                                <input v-model="newUser.username" type="text" placeholder="Username" class="px-3 py-2 border border-gray-300 rounded-md">
+                                                <input v-model="newUser.name" type="text" placeholder="Nama Lengkap" class="px-3 py-2 border border-gray-300 rounded-md">
+                                                <input v-model="newUser.password" type="password" placeholder="Password" class="px-3 py-2 border border-gray-300 rounded-md">
+                                                <button @click="handleAddUser()" class="bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700">
+                                                    Tambah Kasir
+                                                </button>
+                                            </div>
+                                        </div>
+                                        
+                                        <!-- Backup & Restore -->
+                                        <div class="bg-gray-50 p-4 rounded-lg">
+                                            <h4 class="font-medium mb-4">Backup & Restore</h4>
+                                            <div class="flex space-x-4">
+                                                <button @click="backupData()" class="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700">
+                                                    Download Backup
+                                                </button>
+                                                <label class="bg-orange-600 text-white px-4 py-2 rounded-md hover:bg-orange-700 cursor-pointer">
+                                                    Upload Restore
+                                                    <input type="file" accept=".json" @change="restoreData" class="hidden">
+                                                </label>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Cashier View -->
+                    <div v-if="currentView === 'cashier'" class="flex h-screen bg-gray-100">
+                        <!-- Left Panel - Cart -->
+                        <div class="w-1/2 bg-white border-r flex flex-col">
+                            <div class="p-4 border-b">
+                                <h2 class="text-xl font-semibold">Keranjang Belanja</h2>
+                                <div class="flex justify-between mt-2">
+                                    <button @click="openReturModal()" class="text-sm bg-orange-600 text-white px-3 py-1 rounded hover:bg-orange-700">
+                                        Retur Barang
+                                    </button>
+                                    <div class="text-sm text-gray-600">{{ cart.length }} item(s)</div>
+                                </div>
+                            </div>
+                            
+                            <div class="flex-1 overflow-y-auto custom-scrollbar p-4">
+                                <div v-if="cart.length === 0" class="text-center text-gray-500 mt-8">
+                                    Keranjang kosong
+                                </div>
+                                
+                                <div v-for="item in cart" :key="item.sku" class="flex items-center justify-between p-3 border-b">
+                                    <div class="flex-1">
+                                        <div class="font-medium">{{ item.name }}</div>
+                                        <div class="text-sm text-gray-600">{{ item.sku }}</div>
+                                        <div class="text-sm font-medium text-blue-600">Rp {{ formatCurrency(item.price) }}</div>
+                                    </div>
+                                    
+                                    <div class="flex items-center space-x-2">
+                                        <button @click="updateCartQuantity(item.sku, -1)" 
+                                                class="w-8 h-8 bg-red-500 text-white rounded-full flex items-center justify-center hover:bg-red-600">
+                                            −
+                                        </button>
+                                        <span class="w-8 text-center font-medium">{{ item.quantity }}</span>
+                                        <button @click="updateCartQuantity(item.sku, 1)" 
+                                                class="w-8 h-8 bg-green-500 text-white rounded-full flex items-center justify-center hover:bg-green-600">
+                                            +
+                                        </button>
+                                        <button @click="removeFromCart(item.sku)" 
+                                                class="ml-2 text-red-600 hover:text-red-800">
+                                            🗑️
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div class="p-4 border-t bg-gray-50">
+                                <div class="flex justify-between items-center mb-4">
+                                    <span class="text-lg font-semibold">Total:</span>
+                                    <span class="text-2xl font-bold text-blue-600">Rp {{ formatCurrency(cartTotal) }}</span>
+                                </div>
+                                <button @click="openPaymentModal()" 
+                                        :disabled="cart.length === 0"
+                                        class="w-full bg-blue-600 text-white py-3 px-4 rounded-lg font-medium hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed">
+                                    Bayar
+                                </button>
+                            </div>
+                        </div>
+                        
+                        <!-- Right Panel - Product Search -->
+                        <div class="w-1/2 flex flex-col">
+                            <div class="p-4 border-b bg-white">
+                                <h2 class="text-xl font-semibold mb-4">Cari Produk</h2>
+                                <input v-model="searchProduct" 
+                                       @keydown="handleProductSearch"
+                                       type="text" 
+                                       placeholder="Scan barcode atau ketik nama produk..."
+                                       class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                       autofocus>
+                            </div>
+                            
+                            <div class="flex-1 overflow-y-auto custom-scrollbar p-4">
+                                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                    <div v-for="product in filteredProducts" :key="product.sku" 
+                                         @click="addToCart(product)"
+                                         class="border border-gray-200 rounded-lg p-4 hover:shadow-md cursor-pointer transition-shadow">
+                                        <div class="font-medium text-gray-900">{{ product.name }}</div>
+                                        <div class="text-sm text-gray-600">{{ product.sku }} - {{ product.category }}</div>
+                                        <div class="mt-2 flex justify-between items-center">
+                                            <span class="text-lg font-bold text-blue-600">Rp {{ formatCurrency(product.sellPrice) }}</span>
+                                            <span :class="{'text-red-600': product.stock < 10, 'text-green-600': product.stock >= 10}" 
+                                                  class="text-sm font-medium">
+                                                Stok: {{ product.stock }}
+                                            </span>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <div v-if="filteredProducts.length === 0 && searchProduct" class="text-center text-gray-500 mt-8">
+                                    Produk tidak ditemukan
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Product Modal -->
+                <div v-if="showProductModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+                    <div class="bg-white rounded-lg p-6 w-full max-w-md">
+                        <h3 class="text-lg font-semibold mb-4">{{ editingProduct ? 'Edit Produk' : 'Tambah Produk' }}</h3>
+                        
+                        <form @submit.prevent="saveProduct" class="space-y-4">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-2">SKU/Barcode</label>
+                                <input v-model="productForm.sku" type="text" required :disabled="editingProduct"
+                                       class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            </div>
+                            
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-2">Nama Produk</label>
+                                <input v-model="productForm.name" type="text" required
+                                       class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            </div>
+                            
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-2">Kategori</label>
+                                <input v-model="productForm.category" type="text" required
+                                       class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            </div>
+                            
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-2">Stok</label>
+                                <input v-model.number="productForm.stock" type="number" min="0" required
+                                       class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            </div>
+                            
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-2">Harga Beli</label>
+                                <input v-model.number="productForm.buyPrice" type="number" min="0" required
+                                       class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            </div>
+                            
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-2">Harga Jual</label>
+                                <input v-model.number="productForm.sellPrice" type="number" min="0" required
+                                       class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            </div>
+                            
+                            <div class="flex space-x-3 pt-4">
+                                <button type="submit" class="flex-1 bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700">
+                                    {{ editingProduct ? 'Update' : 'Simpan' }}
+                                </button>
+                                <button type="button" @click="showProductModal = false; resetProductForm()"
+                                        class="flex-1 bg-gray-400 text-white py-2 px-4 rounded-md hover:bg-gray-500">
+                                    Batal
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+
+                <!-- Payment Modal -->
+                <div v-if="showPaymentModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+                    <div class="bg-white rounded-lg p-6 w-full max-w-md">
+                        <h3 class="text-lg font-semibold mb-4">Pembayaran</h3>
+                        
+                        <div class="space-y-4">
+                            <div class="bg-gray-50 p-4 rounded-lg">
+                                <div class="flex justify-between items-center mb-2">
+                                    <span>Total Belanja:</span>
+                                    <span class="text-xl font-bold text-blue-600">Rp {{ formatCurrency(cartTotal) }}</span>
+                                </div>
+                            </div>
+                            
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-2">Jumlah Bayar</label>
+                                <input v-model.number="paymentAmount" type="number" min="0" step="1000"
+                                       class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            </div>
+                            
+                            <div class="bg-green-50 p-4 rounded-lg">
+                                <div class="flex justify-between items-center">
+                                    <span>Kembalian:</span>
+                                    <span class="text-xl font-bold text-green-600">Rp {{ formatCurrency(changeAmount) }}</span>
+                                </div>
+                            </div>
+                            
+                            <div class="grid grid-cols-3 gap-2">
+                                <button @click="paymentAmount = cartTotal" class="bg-gray-200 text-gray-800 py-2 px-4 rounded-md hover:bg-gray-300">
+                                    Pas
+                                </button>
+                                <button @click="paymentAmount = Math.ceil(cartTotal / 5000) * 5000" class="bg-gray-200 text-gray-800 py-2 px-4 rounded-md hover:bg-gray-300">
+                                    +5k
+                                </button>
+                                <button @click="paymentAmount = Math.ceil(cartTotal / 10000) * 10000" class="bg-gray-200 text-gray-800 py-2 px-4 rounded-md hover:bg-gray-300">
+                                    +10k
+                                </button>
+                            </div>
+                            
+                            <div class="flex space-x-3 pt-4">
+                                <button @click="processPayment()" 
+                                        :disabled="paymentAmount < cartTotal"
+                                        class="flex-1 bg-green-600 text-white py-2 px-4 rounded-md hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed">
+                                    Selesaikan & Cetak
+                                </button>
+                                <button @click="showPaymentModal = false"
+                                        class="flex-1 bg-gray-400 text-white py-2 px-4 rounded-md hover:bg-gray-500">
+                                    Batal
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Retur Modal -->
+                <div v-if="showReturModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+                    <div class="bg-white rounded-lg p-6 w-full max-w-2xl">
+                        <h3 class="text-lg font-semibold mb-4">Retur Barang</h3>
+                        
+                        <div class="space-y-4">
+                            <div class="flex space-x-4">
+                                <div class="flex-1">
+                                    <label class="block text-sm font-medium text-gray-700 mb-2">No. Transaksi</label>
+                                    <input v-model="returTransactionNo" type="text" placeholder="Masukkan nomor transaksi"
+                                           class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                                </div>
+                                <div class="flex items-end">
+                                    <button @click="searchReturTransaction()" class="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700">
+                                        Cari
+                                    </button>
+                                </div>
+                            </div>
+                            
+                            <div v-if="returItems.length > 0">
+                                <h4 class="font-medium mb-2">Item yang dapat diretur:</h4>
+                                <div class="max-h-64 overflow-y-auto custom-scrollbar border rounded-lg">
+                                    <div v-for="item in returItems" :key="item.sku" class="flex items-center justify-between p-3 border-b">
+                                        <div class="flex items-center space-x-3">
+                                            <input v-model="item.selected" type="checkbox" class="rounded">
+                                            <div>
+                                                <div class="font-medium">{{ item.name }}</div>
+                                                <div class="text-sm text-gray-600">Qty: {{ item.quantity }} - Rp {{ formatCurrency(item.price) }}</div>
+                                            </div>
+                                        </div>
+                                        <div class="flex items-center space-x-2">
+                                            <label class="text-sm">Retur:</label>
+                                            <input v-model.number="item.returQuantity" 
+                                                   :max="item.quantity" 
+                                                   :disabled="!item.selected"
+                                                   type="number" min="0" 
+                                                   class="w-16 px-2 py-1 border border-gray-300 rounded">
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 mb-2">Password Admin</label>
+                                <input v-model="adminPassword" type="password" placeholder="Masukkan password admin"
+                                       class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            </div>
+                            
+                            <div class="flex space-x-3 pt-4">
+                                <button @click="processRetur()" 
+                                        :disabled="returItems.filter(i => i.selected && i.returQuantity > 0).length === 0"
+                                        class="flex-1 bg-orange-600 text-white py-2 px-4 rounded-md hover:bg-orange-700 disabled:bg-gray-400 disabled:cursor-not-allowed">
+                                    Proses Retur
+                                </button>
+                                <button @click="showReturModal = false"
+                                        class="flex-1 bg-gray-400 text-white py-2 px-4 rounded-md hover:bg-gray-500">
+                                    Batal
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `,
+            
+            data() {
+                return {
+                    // Additional reactive data for template
+                    loginForm: {
+                        username: '',
+                        password: ''
+                    },
+                    adminTab: 'inventory',
+                    newUser: {
+                        username: '',
+                        name: '',
+                        password: ''
+                    }
+                };
+            },
+            
+            methods: {
+                async handleLogin() {
+                    const success = await this.login(this.loginForm.username, this.loginForm.password);
+                    if (!success) {
+                        alert('Username atau password salah!');
+                    }
+                    this.loginForm.username = '';
+                    this.loginForm.password = '';
+                },
+                
+                async handleAddUser() {
+                    if (!this.newUser.username || !this.newUser.name || !this.newUser.password) {
+                        alert('Semua field harus diisi!');
+                        return;
+                    }
+                    
+                    const success = await this.addUser(this.newUser.username, this.newUser.password, 'kasir', this.newUser.name);
+                    if (success) {
+                        this.newUser = { username: '', name: '', password: '' };
+                        alert('User berhasil ditambahkan!');
+                    }
+                }
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>
